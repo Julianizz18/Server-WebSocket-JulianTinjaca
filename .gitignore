@@ -1,0 +1,9 @@
+target/
+*.class
+*.log
+.idea/
+*.iml
+.mvn/
+!.mvn/wrapper/maven-wrapper.jar
+.DS_Store
+HELP.md
