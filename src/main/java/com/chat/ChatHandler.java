@@ -1,6 +1,14 @@
 package com.chat;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
+import net.logstash.logback.argument.StructuredArguments;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
@@ -13,8 +21,11 @@ import java.util.stream.Collectors;
 
 /**
  * ChatHandler — gestiona el ciclo de vida de cada sesión WebSocket.
- * CopyOnWriteArraySet es thread-safe: Spring puede llamar a estos
- * métodos desde distintos hilos simultáneamente.
+ *
+ * Instrumentado con:
+ *  - Métricas (Micrometer → Prometheus → Grafana)
+ *  - Trazas   (Micrometer Tracing/Brave → Zipkin)
+ *  - Logs estructurados (Logback JSON → Logstash → Elasticsearch → Kibana)
  *
  * El username de cada sesión se guarda en session.getAttributes(),
  * así no necesitamos un Map aparte para asociar sesión → usuario.
@@ -23,33 +34,79 @@ import java.util.stream.Collectors;
 public class ChatHandler extends TextWebSocketHandler {
 
     private static final String USERNAME_ATTR = "username";
+    private static final Logger log = LoggerFactory.getLogger(ChatHandler.class);
 
     // Conjunto de todas las sesiones WebSocket activas
     private final Set<WebSocketSession> sessions =
             new CopyOnWriteArraySet<>();
 
     private final ObjectMapper mapper = new ObjectMapper();
+    private final Tracer tracer;
+
+    // ── Métricas ─────────────────────────────────────────
+    private final Counter messagesReceived;
+    private final Counter messagesBroadcast;
+
+    public ChatHandler(MeterRegistry registry, Tracer tracer) {
+        this.tracer = tracer;
+
+        // Counter: acumula el total de mensajes recibidos (solo sube)
+        this.messagesReceived = Counter.builder("ws.messages.received")
+                .description("Total de mensajes recibidos del cliente")
+                .register(registry);
+
+        // Counter: mensajes enviados en broadcast (puede ser N por mensaje)
+        this.messagesBroadcast = Counter.builder("ws.messages.broadcast")
+                .description("Total de mensajes enviados a clientes")
+                .register(registry);
+
+        // Gauge: valor actual de sesiones abiertas (sube y baja)
+        Gauge.builder("ws.sessions.active", sessions, Set::size)
+                .description("Sesiones WebSocket activas en este momento")
+                .register(registry);
+    }
 
     // ── Se llama cuando un cliente se CONECTA (aún sin username) ──
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         sessions.add(session);
-        System.out.println("🟢 Conexión abierta: " + session.getId());
+        // El Gauge de ws.sessions.active se actualiza automáticamente
+        log.info("WS_CONNECTED",
+                StructuredArguments.kv("session_id", session.getId()),
+                StructuredArguments.kv("active_sessions", sessions.size())
+        );
     }
 
     // ── Se llama cuando llega un MENSAJE de texto ──────
     @Override
     protected void handleTextMessage(WebSocketSession session,
                                       TextMessage message) throws Exception {
+        messagesReceived.increment(); // ← +1 por cada mensaje entrante
+
+        String type = "message";
         try {
-            ChatMessage incoming = mapper.readValue(
-                    message.getPayload(), ChatMessage.class);
+            // Necesitamos el type antes de abrir el span, para taguearlo
+            ChatMessage peek = mapper.readValue(message.getPayload(), ChatMessage.class);
+            type = peek.getType() == null ? "message" : peek.getType();
 
-            switch (incoming.getType() == null ? "message" : incoming.getType()) {
+            // Span de esta operación — visible en Zipkin con sus tags
+            Span span = tracer.nextSpan()
+                    .name("ws.handle-message")
+                    .tag("session.id", session.getId())
+                    .tag("message.type", type)
+                    .start();
 
-                case "join" -> handleJoin(session, incoming);
-                case "typing" -> handleTyping(session, incoming);
-                default -> handleChatMessage(incoming);
+            try (Tracer.SpanInScope scope = tracer.withSpan(span)) {
+                switch (type) {
+                    case "join" -> handleJoin(session, peek, span);
+                    case "typing" -> handleTyping(session, peek);
+                    default -> handleChatMessage(peek, span);
+                }
+            } catch (Exception e) {
+                span.error(e); // ← marca el span como FAILED en Zipkin
+                throw e;
+            } finally {
+                span.end(); // ← SIEMPRE cerrar el span, incluso si hay error
             }
 
         } catch (Exception e) {
@@ -58,9 +115,15 @@ public class ChatHandler extends TextWebSocketHandler {
     }
 
     // ── Un usuario elige nombre y entra al chat ────────
-    private void handleJoin(WebSocketSession session, ChatMessage incoming) throws Exception {
+    private void handleJoin(WebSocketSession session, ChatMessage incoming, Span span) throws Exception {
         session.getAttributes().put(USERNAME_ATTR, incoming.getUsername());
-        System.out.println("👋 " + incoming.getUsername() + " se unió | Total: " + sessions.size());
+
+        span.tag("chat.username", incoming.getUsername());
+
+        log.info("WS_JOINED",
+                StructuredArguments.kv("username", incoming.getUsername()),
+                StructuredArguments.kv("active_sessions", sessions.size())
+        );
 
         ChatMessage joinMsg = new ChatMessage("system",
                 incoming.getUsername() + " se unió al chat", sessions.size());
@@ -78,8 +141,17 @@ public class ChatHandler extends TextWebSocketHandler {
     }
 
     // ── Mensaje normal de chat ──────────────────────────
-    private void handleChatMessage(ChatMessage incoming) throws Exception {
-        System.out.println("💬 [" + incoming.getUsername() + "] " + incoming.getText());
+    private void handleChatMessage(ChatMessage incoming, Span span) throws Exception {
+        // Agregar contexto al span — se verá en la UI de Zipkin
+        span.tag("chat.username", incoming.getUsername());
+        span.tag("chat.text_length", String.valueOf(incoming.getText().length()));
+        span.tag("chat.active_users", String.valueOf(sessions.size()));
+
+        log.info("WS_MESSAGE",
+                StructuredArguments.kv("username", incoming.getUsername()),
+                StructuredArguments.kv("message_length", incoming.getText().length()),
+                StructuredArguments.kv("active_sessions", sessions.size())
+        );
 
         ChatMessage outgoing = new ChatMessage();
         outgoing.setType("message");
@@ -96,7 +168,12 @@ public class ChatHandler extends TextWebSocketHandler {
                                        CloseStatus status) throws Exception {
         String username = (String) session.getAttributes().get(USERNAME_ATTR);
         sessions.remove(session);
-        System.out.println("🔴 Desconectado: " + session.getId() + " | Total: " + sessions.size());
+
+        log.info("WS_DISCONNECTED",
+                StructuredArguments.kv("session_id", session.getId()),
+                StructuredArguments.kv("close_status", status.getCode()),
+                StructuredArguments.kv("active_sessions", sessions.size())
+        );
 
         // Solo avisamos al resto si el usuario alcanzó a ponerse un nombre
         if (username != null) {
@@ -137,6 +214,7 @@ public class ChatHandler extends TextWebSocketHandler {
                 synchronized (s) {  // WebSocketSession NO es thread-safe al escribir
                     s.sendMessage(frame);
                 }
+                messagesBroadcast.increment(); // ← +1 por cada cliente que recibe
             }
         }
     }

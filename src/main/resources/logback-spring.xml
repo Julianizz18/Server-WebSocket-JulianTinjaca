@@ -1,0 +1,28 @@
+<configuration>
+
+  <!-- Consola: formato legible para el desarrollador -->
+  <appender name="CONSOLE"
+             class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss} %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Logstash: JSON estructurado por TCP -->
+  <appender name="LOGSTASH"
+             class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+    <destination>localhost:5000</destination>
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <!-- Incluye traceId y spanId de Micrometer Tracing en cada log
+           Esto permite correlacionar un log en Kibana con su traza en Zipkin -->
+      <includeMdcKeyName>traceId</includeMdcKeyName>
+      <includeMdcKeyName>spanId</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"  />
+    <appender-ref ref="LOGSTASH" />
+  </root>
+
+</configuration>
