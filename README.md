@@ -33,14 +33,22 @@ ws-server/
 ## Requisitos
 
 - Java 17+
-- Maven 3.8+
+- **Maven NO es obligatorio** — el proyecto incluye el Maven Wrapper (`mvnw` / `mvnw.cmd`), que descarga Maven automáticamente la primera vez que lo corres
 - Docker (solo si quieres levantar el stack de observabilidad)
 
 ## Cómo correrlo
 
-```bash
-mvn spring-boot:run
+**Windows (PowerShell o CMD):**
+```powershell
+.\mvnw.cmd spring-boot:run
 ```
+
+**Mac / Linux:**
+```bash
+./mvnw spring-boot:run
+```
+
+La primera vez tarda un poco más porque descarga Maven solo; las siguientes veces arranca directo. Si prefieres usar tu propio Maven instalado, `mvn spring-boot:run` también funciona igual.
 
 El WebSocket queda listo en `ws://localhost:8080/chat`.
 
